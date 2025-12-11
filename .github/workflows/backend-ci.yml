@@ -8,6 +8,9 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/zynk-backend
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: zynk-backend
+  ECR_IMAGE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
 
 jobs:
   build-and-push:
@@ -15,6 +18,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -31,6 +35,14 @@ jobs:
         working-directory: backend
         run: npm ci --ignore-scripts
 
+      - name: Configure AWS credentials
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Log in to GHCR
         if: github.event_name == 'push'
         uses: docker/login-action@v3
@@ -38,6 +50,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Amazon ECR
+        if: github.event_name == 'push'
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -48,6 +64,56 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.ECR_IMAGE }}:latest
+            ${{ env.ECR_IMAGE }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy-ecs:
+    needs: build-and-push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      CLUSTER_NAME: zynk-backend-cluster
+      SERVICE_NAME: zynk-backend-service
+      CONTAINER_NAME: zynk-backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Render task definition from template
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          IMAGE_URI: ${{ env.ECR_IMAGE }}:${{ github.sha }}
+        run: |
+          mkdir -p infra/rendered
+          envsubst < infra/ecs-task-def.json.tpl > infra/rendered/ecs-task-def.json
+          jq --arg image "$IMAGE_URI" '
+            .containerDefinitions = (
+              .containerDefinitions | map(if .name == $container then (.image = $image) else . end)
+            )
+          ' --arg container "$CONTAINER_NAME" infra/rendered/ecs-task-def.json > infra/rendered/ecs-task-def.final.json
+
+      - name: Deploy service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: infra/rendered/ecs-task-def.final.json
+          service: ${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER_NAME }}
+          wait-for-service-stability: true
 
